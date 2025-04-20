@@ -1,0 +1,8 @@
+[package]
+name = "sum_check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ff = "0.13.1"
+bls12_381 = "0.8.0"
