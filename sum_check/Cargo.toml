@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 ff = "0.13.1"
 bls12_381 = "0.8.0"
+rand = "0.9.1"
