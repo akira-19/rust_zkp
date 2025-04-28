@@ -2,8 +2,18 @@ use bls12_381::Scalar;
 use ff::Field;
 use rand::Rng;
 use std::sync::Arc;
-use std::time::Instant;
-use std::vec;
+
+type GpFunc = Arc<dyn Fn(&[Scalar]) -> Scalar>;
+type GiFunc = Arc<dyn Fn(Scalar) -> Scalar>;
+
+macro_rules! duration {
+    ($label:expr, $body:block) => {{
+        let _start = std::time::Instant::now();
+        let ret = { $body };
+        println!("{} took {:?}", $label, _start.elapsed());
+        ret
+    }};
+}
 
 // g1(X1) = sigma g(X1, x2, x3...)
 // g2(X2) = sigma g(r1, X2, x3...)
@@ -15,7 +25,7 @@ use std::vec;
 // g4(X4) = gp_5([r1, r2, r3, X4])と計算できる。
 
 pub struct SumCheck {
-    gp_is: Vec<Arc<dyn Fn(&[Scalar]) -> Scalar>>,
+    gp_is: Vec<GpFunc>,
     pub h: Scalar,
 }
 
@@ -28,37 +38,34 @@ impl SumCheck {
     }
 
     pub fn g(b: &[Scalar]) -> Scalar {
-        b.iter()
-            .enumerate()
-            .map(|(i, &val)| Scalar::from(i as u64) * val.pow(&[i as u64, 0, 0, 0]))
-            .sum()
+        // b.iter()
+        //     .enumerate()
+        //     .map(|(i, &val)| Scalar::from(i as u64) * val.pow(&[i as u64, 0, 0, 0]))
+        //     .sum()
+        b.iter().enumerate().fold(Scalar::ZERO, |acc, (i, &val)| {
+            acc + Scalar::from(i as u64) * val.pow_vartime(&[i as u64, 0, 0, 0])
+        })
     }
 
     /// gpᵢ(x₁,…,xᵢ) = gpᵢ₊₁(x₁,…,xᵢ,0) + gpᵢ₊₁(x₁,…,xᵢ,1)
-    fn cal_gp_i(
-        &self,
-        g: Arc<dyn Fn(&[Scalar]) -> Scalar>,
-        i: usize,
-    ) -> Arc<dyn Fn(&[Scalar]) -> Scalar> {
+    fn cal_gp_i(&self, g: GpFunc, i: usize) -> GpFunc {
         Arc::new(move |x: &[Scalar]| -> Scalar {
             assert_eq!(x.len(), i, "Expected {} args, got {}", i, x.len());
 
-            let mut tmp = x.to_vec();
-            tmp.push(Scalar::ZERO);
-            let mut sum = g(&tmp);
+            // 1 回だけ確保し、最後の要素だけ書き換える
+            let mut buf = Vec::with_capacity(i + 1);
+            buf.extend_from_slice(x);
+            buf.push(Scalar::ZERO);
+            let mut sum = g(&buf);
 
-            tmp[i] = Scalar::ONE;
-            sum += g(&tmp);
+            *buf.last_mut().unwrap() = Scalar::ONE;
+            sum += g(&buf);
 
             sum
         })
     }
 
-    pub fn gi_xi(
-        &self,
-        gp_i: Arc<dyn Fn(&[Scalar]) -> Scalar>,
-        rs: &[Scalar],
-    ) -> Arc<dyn Fn(Scalar) -> Scalar> {
+    pub fn gi_xi(&self, gp_i: Arc<dyn Fn(&[Scalar]) -> Scalar>, rs: &[Scalar]) -> GiFunc {
         let fixed_rs: Vec<Scalar> = rs.to_vec();
 
         Arc::new(move |x: Scalar| -> Scalar {
@@ -77,64 +84,44 @@ impl SumCheck {
     {
         assert!(v > 0, "v must be ≥ 1");
 
-        let mut i = v - 1;
-        let mut gp_i: Arc<dyn Fn(&[Scalar]) -> Scalar> = Arc::new(g);
-
-        while i > 0 {
+        let mut gp_i: GpFunc = Arc::new(g);
+        for i in (0..v).rev() {
             gp_i = self.cal_gp_i(gp_i, i);
-            self.gp_is.insert(0, Arc::clone(&gp_i));
-            i -= 1;
+            self.gp_is.insert(0, Arc::clone(&gp_i)); // gp₁ が index 0
         }
-
-        gp_i = self.cal_gp_i(gp_i, i);
-        self.gp_is.insert(0, Arc::clone(&gp_i));
-
-        let h = gp_i(&[]);
-        self.h = h;
+        self.h = gp_i(&[]);
     }
 }
 
 fn main() {
     let mut sumcheck = SumCheck::new();
-    let p = 13;
+    let p = 8;
 
-    let start = Instant::now();
-    // pがhを計算
-    sumcheck.cal_h(|x| SumCheck::g(x), p);
+    duration!("compute h", { sumcheck.cal_h(|x| SumCheck::g(x), p) });
 
-    let duration = start.elapsed();
-    println!("Time taken by calc h: {:?}", duration);
-
-    let start = Instant::now();
-
-    let gp_1 = sumcheck.gp_is[1].clone();
-    let g1x1 = sumcheck.gi_xi(gp_1, &[]);
-
-    assert_eq!(sumcheck.h, g1x1(Scalar::ZERO) + g1x1(Scalar::ONE));
-
-    let mut rs = vec![];
-    let mut last_gixi = g1x1;
-
-    for i in 2..p {
+    duration!("sumcheck protocol", {
         let mut rng = rand::rng();
-        let r_i = Scalar::from(rng.random_range(1..10000));
-        rs.push(r_i);
-        let gp_i = sumcheck.gp_is[i].clone();
-        let gixi = sumcheck.gi_xi(gp_i, &rs);
+        let mut rs = Vec::new();
+        let mut gixi = sumcheck.gi_xi(sumcheck.gp_is[1].clone(), &[]);
 
-        assert_eq!(last_gixi(r_i), gixi(Scalar::ZERO) + gixi(Scalar::ONE));
+        // ---------- ラウンド 1 ----------
+        assert_eq!(sumcheck.h, gixi(Scalar::ZERO) + gixi(Scalar::ONE));
 
-        last_gixi = gixi;
-    }
+        // ---------- ラウンド 2 以降 ----------
+        for i in 2..p {
+            let r_i = Scalar::from(rng.random_range(1..10_000));
+            rs.push(r_i);
 
-    let duration = start.elapsed();
-    println!("Time taken by sumcheck: {:?}", duration);
+            // gᵢ(x) を生成
+            let gixi_next = sumcheck.gi_xi(sumcheck.gp_is[i].clone(), &rs);
 
-    // pub fn gi_xi(
-    //     &self,
-    //     gp_i: Arc<dyn Fn(&[Scalar]) -> Scalar>,
-    //     rs: &[Scalar],
-    // )
+            // 検証条件：gᵢ₋₁(rᵢ) = gᵢ(0) + gᵢ(1)
+            assert_eq!(gixi(r_i), gixi_next(Scalar::ZERO) + gixi_next(Scalar::ONE));
+
+            // 次ラウンドへ
+            gixi = gixi_next;
+        }
+    });
 
     println!("{}", sumcheck.h);
 }
